@@ -1,67 +1,46 @@
 #include <stdio.h>
-
-#include <openssl/bio.h>
-#include <openssl/ssl.h>
 #include <string.h>
 
-// include on Windows
+#include <openssl/bn.h>
+#include <openssl/bio.h>
+#include <openssl/ssl.h>
 
-#ifdef _WIN32
-#include <openssl/applink.c>
-#endif
-
-#define CERT_REQUEST_KEY_PATH  "cert.key"
-#define GENERATED_CERT_REQUEST_SAVE_PATH  "generated_request.csr"
 
 #define CERT_CA_PATH "ca.pem"
 #define CERT_CA_KEY_PATH "root.key"
+#define CERT_REQUEST_KEY_PATH  "cert.key"
 #define GENERATED_CERT_SAVE_PATH "generated_cert.crt"
 
-// the app mimics the following two commands.
-//
-// openssl req -new -key CERT_REQUEST_KEY_PATH -out GENERATED_CERT_REQUEST_SAVE_PATH
-// openssl x509 -req -in GENERATED_CERT_SAVE_PATH -CA CERT_CA_PATH -CAkey CERT_CA_KEY_PATH -CAcreateserial -out GENERATED_CERT_SAVE_PATH -days 5000
-
-X509_REQ *generate_cert_req(const char *p_path) {
-    FILE *p_file = NULL;
-    EVP_PKEY *p_key = NULL;
-    X509_REQ *p_x509_req = NULL;
-
-    if (NULL == (p_file = fopen(p_path, "r"))) {
-        printf("failed to open the private key file\n");
-        goto CLEANUP;
-    }
-
-    if (NULL == (p_key = PEM_read_PrivateKey(p_file, NULL, NULL, NULL))) {
-        printf("failed to read the private key file\n");
-        goto CLEANUP;
-    }
-
-    if (NULL == (p_x509_req = X509_REQ_new())) {
-        printf("failed to create a new X509 REQ\n");
-        goto CLEANUP;
-    }
-
-    if (0 > X509_REQ_set_pubkey(p_x509_req, p_key)) {
-        printf("failed to set pub key\n");
-        X509_REQ_free(p_x509_req);
-        p_x509_req = NULL;
-        goto CLEANUP;
-    }
-
-    if (0 > X509_REQ_sign(p_x509_req, p_key, EVP_sha256())) {
-        printf("failed to sign the certificate\n");
-        X509_REQ_free(p_x509_req);
-        p_x509_req = NULL;
-        goto CLEANUP;
-    }
-
-    CLEANUP:
-    fclose(p_file);
-    EVP_PKEY_free(p_key);
-
-    return p_x509_req;
+static void rsa_gen_key_callback(int p, int n, void *arg) {
+	char c='B';
+	if (p == 0) c='.';
+	if (p == 1) c='+';
+	if (p == 2) c='*';
+	if (p == 3) c='\n';
+	fputc(c,stderr);
 }
+
+#if 0
+static int add_ext(X509 *cert, int nid, char *value) {
+	X509_EXTENSION *ex;
+	X509V3_CTX ctx;
+	/* This sets the 'context' of the extensions. */
+	/* No configuration database */
+	X509V3_set_ctx_nodb(&ctx);
+	/* Issuer and subject certs: both the target since it is self signed,
+	 * no request and no CRL
+	 */
+	X509V3_set_ctx(&ctx, cert, cert, NULL, NULL, 0);
+	ex = X509V3_EXT_conf_nid(NULL, &ctx, nid, value);
+	if (!ex)
+		return 0;
+
+	X509_add_ext(cert,ex,-1);
+	X509_EXTENSION_free(ex);
+	return 1;
+}
+#endif
+
 
 int randSerial(ASN1_INTEGER *ai) {
     BIGNUM *p_bignum = NULL;
@@ -183,10 +162,12 @@ X509 *generate_cert(X509_REQ *pCertReq, const char *p_ca_path, const char *p_ca_
     EVP_PKEY *p_ca_key_pkey = NULL;
     X509 *p_generated_cert = NULL;
     ASN1_INTEGER *p_serial_number = NULL;
-    EVP_PKEY *p_cert_req_pkey = NULL;
     FILE *p_file = NULL;
     EVP_PKEY *p_key = NULL;
 	X509_NAME *xn = NULL;
+	RSA *rsa;
+	int bits=2048;
+	BIGNUM *e;
 
     if (NULL == (p_ca_file = fopen(p_ca_path, "r"))) {
         printf("failed to open the ca file\n");
@@ -221,44 +202,48 @@ X509 *generate_cert(X509_REQ *pCertReq, const char *p_ca_path, const char *p_ca_
     p_serial_number = ASN1_INTEGER_new();
     randSerial(p_serial_number);
     X509_set_serialNumber(p_generated_cert, p_serial_number);
+
 	xn=parse_name("/C=US/CN=OpenSSL Group Circle/",0);
-
-	/*
-	if ((xn = d2i_X509_NAME(NULL, ((const unsigned char **)&namebytes), -1)) == NULL) {
-        printf("failed to convert x509 name\n");
-        goto CLEANUP;
-	}
-	*/
-
     X509_set_subject_name(p_generated_cert, xn);
 
     X509_gmtime_adj(X509_get_notBefore(p_generated_cert), 0L);
     X509_gmtime_adj(X509_get_notAfter(p_generated_cert), 31536000L);
 
 #if 0
-    if (NULL == (p_cert_req_pkey = X509_REQ_get_pubkey(pCertReq))) {
-        printf("failed to get certificate req pkey\n");
-        X509_free(p_generated_cert);
-        p_generated_cert = NULL;
-        goto CLEANUP;
-    }
-#endif
+	/* get user cert private key */
     if (NULL == (p_file = fopen(CERT_REQUEST_KEY_PATH, "r"))) {
         printf("failed to open the cert private key file\n");
         goto CLEANUP;
     }
-
     if (NULL == (p_key = PEM_read_PrivateKey(p_file, NULL, NULL, NULL))) {
         printf("failed to read the private key file\n");
         goto CLEANUP;
     }
+#endif
 
-    if (0 > X509_set_pubkey(p_generated_cert, p_key /*p_cert_req_pkey*/)) {
+	if ((p_key=EVP_PKEY_new()) == NULL) {
+        printf("failed to new pkey\n");
+        goto CLEANUP;
+	}
+
+	e=BN_new();
+	BN_set_word(e, RSA_F4);
+	rsa = RSA_new();
+	RSA_generate_key_ex(rsa, bits, e, NULL);
+
+	//RSA_generate_key_ex(&rsa,bits,RSA_F4,rsa_gen_key_callback,NULL);
+	if (!EVP_PKEY_assign_RSA(p_key,rsa)) {
+        printf("failed to assign key\n");
+        goto CLEANUP;
+	}
+
+    if (0 > X509_set_pubkey(p_generated_cert, p_key )) {
         printf("failed to set pkey\n");
         X509_free(p_generated_cert);
         p_generated_cert = NULL;
         goto CLEANUP;
     }
+
 
     if (0 > EVP_PKEY_copy_parameters(p_ca_pkey, p_ca_key_pkey)) {
         printf("failed to copy parameters\n");
@@ -283,21 +268,10 @@ X509 *generate_cert(X509_REQ *pCertReq, const char *p_ca_path, const char *p_ca_
     fclose(p_ca_key_file);
     EVP_PKEY_free(p_ca_key_pkey);
     ASN1_INTEGER_free(p_serial_number);
-    EVP_PKEY_free(p_cert_req_pkey);
+	BN_free(e);
+	RSA_free(rsa);
 
     return p_generated_cert;
-}
-
-int save_cert_req(X509_REQ *p_cert_req, const char *path) {
-    FILE *p_file = NULL;
-    if (NULL == (p_file = fopen(path, "w"))) {
-        printf("failed to open file for saving csr\n");
-        return -1;
-    }
-
-    PEM_write_X509_REQ(p_file, p_cert_req);
-    fclose(p_file);
-    return 0;
 }
 
 int save_cert(X509 *p_generated_cert, const char *path) {
@@ -316,21 +290,6 @@ int main() {
     int ret = 0;
     X509_REQ *p_cert_req = NULL;
     X509 *p_generated_cert = NULL;
-
-#if 0
-    p_cert_req = generate_cert_req(CERT_REQUEST_KEY_PATH);
-    if (NULL == p_cert_req) {
-        printf("failed to generate cert req\n");
-        ret = -1;
-        goto CLEANUP;
-    }
-
-    if (save_cert_req(p_cert_req, GENERATED_CERT_REQUEST_SAVE_PATH)) {
-        printf("failed to save generated cert request\n");
-        ret = -1;
-        goto CLEANUP;
-    }
-#endif
 
     p_generated_cert = generate_cert(p_cert_req, CERT_CA_PATH, CERT_CA_KEY_PATH);
     if (NULL == p_generated_cert) {
